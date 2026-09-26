@@ -69,6 +69,30 @@ button, input, textarea { font: inherit; }
 .lesson-row h4 { margin: 0; font-size: .9rem; }
 .lesson-row p { color: var(--muted); font-size: .7rem; margin: 5px 0 0; }
 .lesson-actions { display: flex; align-items: center; gap: 7px; }
+.lesson-row-expanded { grid-template-columns: minmax(0, 1fr) auto; }
+.lesson-info { min-width: 0; }
+.lesson-title-line { display: flex; align-items: center; gap: 8px; }
+.lesson-title-line h4 { min-width: 0; }
+.lesson-actions-vertical { align-self: stretch; flex-direction: column; justify-content: center; }
+.package-badge { flex: 0 0 auto; border-radius: 999px; padding: 3px 7px; background: var(--line); color: var(--muted); font-size: .62rem; font-weight: 800; }
+.package-badge.current { background: #e9f8f2; color: var(--success); }
+.package-badge.stale { background: #fff3d6; color: #9a6500; }
+.package-badge.expired, .package-badge.damaged { background: #ffecec; color: var(--danger); }
+.package-meta { word-break: break-word; }
+.notice-banner { display: flex; justify-content: space-between; align-items: center; gap: 10px; border-radius: 14px; padding: 11px 13px; margin-bottom: 13px; background: var(--soft); color: var(--primary); font-size: .72rem; line-height: 1.45; }
+.notice-banner strong, .notice-banner span { display: block; }
+.notice-banner.warning { background: #fff3d6; color: #8a5a00; }
+.blocked-card { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 28px 18px; margin: 28px 0; text-align: center; box-shadow: 0 8px 26px rgb(28 44 72 / .06); }
+.blocked-card strong { display: block; font-size: 1.05rem; margin-bottom: 9px; }
+.blocked-card p { color: var(--muted); font-size: .8rem; line-height: 1.65; margin: 0 0 18px; }
+.readonly-tip { margin: 9px 2px 0; color: var(--muted); font-size: .72rem; line-height: 1.5; }
+.answer-key { font-weight: 700; color: var(--text); }
+.package-checklist { margin: 0; padding-left: 18px; color: var(--muted); font-size: .7rem; line-height: 1.75; word-break: break-all; }
+.offline-records { display: grid; gap: 8px; }
+.record-row { display: flex; justify-content: space-between; align-items: center; width: 100%; border: 1px solid var(--line); background: var(--app-bg); color: var(--text); border-radius: 12px; padding: 11px 12px; cursor: pointer; text-align: left; }
+.record-row span { color: var(--muted); font-size: .7rem; }
+.link-button { border: 0; background: transparent; padding: 0; color: var(--text); font-weight: 700; cursor: pointer; text-align: left; }
+.empty-state.compact { padding: 18px 8px; font-size: .76rem; }
 .stale-badge { display: inline-flex; align-items: center; gap: 4px; }
 .offline-banner { display: flex; justify-content: space-between; align-items: center; border-radius: 13px; padding: 10px 12px; margin-bottom: 13px; background: #fff6dc; color: #795300; font-size: .73rem; }
 .offline-banner.online { background: #e9f8f2; color: #126c50; }

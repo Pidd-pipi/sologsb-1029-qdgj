@@ -16,7 +16,7 @@ export interface Lesson {
   subtitle: string;
   level: string;
   estimatedMinutes: number;
-  downloaded: boolean;
+  version: number;
   sentences: Sentence[];
 }
 
@@ -27,6 +27,16 @@ export interface Course {
   level: string;
   accent: string;
   lessons: Lesson[];
+}
+
+export interface OfflinePackage {
+  lessonId: string;
+  version: number;
+  contentHash: string;
+  content: Lesson;
+  cachedAt: string;
+  expiresAt: string;
+  cacheDurationDays: number;
 }
 
 export interface TokenResult {
@@ -51,6 +61,7 @@ export interface PracticeAttempt {
   lessonId: string;
   lessonTitle: string;
   courseTitle: string;
+  contentVersion: number;
   submittedAt: string;
   score: number;
   sentenceAttempts: SentenceAttempt[];
@@ -64,8 +75,10 @@ export interface LessonProgress {
 }
 
 export interface PersistedState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   courses: Course[];
+  offlinePackages: Record<string, OfflinePackage>;
+  downloadingLessonIds: string[];
   attempts: PracticeAttempt[];
   progress: Record<string, LessonProgress>;
   activeLessonId: string;

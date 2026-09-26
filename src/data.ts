@@ -1,4 +1,29 @@
-import type { Course, PersistedState } from './types';
+import { createOfflinePackage } from './offline';
+import type { Course, Lesson, PersistedState } from './types';
+
+const airportCheckinV1: Lesson = {
+  id: 'airport-01',
+  courseId: 'daily-life',
+  title: '办理值机',
+  subtitle: 'Check-in conversation',
+  level: '入门',
+  estimatedMinutes: 6,
+  version: 1,
+  sentences: [
+    { id: 'airport-01-s1', text: 'I would like to check in for my flight to London.', translation: '我想办理飞往伦敦的航班值机。', note: 'check in 连读时重音落在 check。' },
+    { id: 'airport-01-s2', text: 'Could I have a window seat, please?', translation: '请问可以给我一个靠窗座位吗？', note: 'Could I 的 d 与 I 连读较轻。' },
+    { id: 'airport-01-s3', text: 'How many bags are you checking in today?', translation: '您今天要托运几件行李？', note: 'bags are 中 s 与 a 连读。' },
+    { id: 'airport-01-s4', text: 'Your gate is B twelve and boarding starts at six thirty.', translation: '您的登机口是 B12，六点半开始登机。', note: 'B twelve 按字母 B 加数字读。' }
+  ]
+};
+
+const airportCheckinV2: Lesson = {
+  ...structuredClone(airportCheckinV1),
+  version: 2,
+  sentences: airportCheckinV1.sentences.map((sentence) => sentence.id === 'airport-01-s4'
+    ? { ...sentence, text: 'Your gate is B twelve and boarding starts at six fifteen.', translation: '您的登机口是 B12，六点十五分开始登机。', note: 'fifteen 有两个重读音节，注意和 fifty 区分。' }
+    : sentence)
+};
 
 export const demoCourses: Course[] = [
   {
@@ -8,21 +33,7 @@ export const demoCourses: Course[] = [
     level: 'A2',
     accent: '#1769e0',
     lessons: [
-      {
-        id: 'airport-01',
-        courseId: 'daily-life',
-        title: '办理值机',
-        subtitle: 'Check-in conversation',
-        level: '入门',
-        estimatedMinutes: 6,
-        downloaded: true,
-        sentences: [
-          { id: 'airport-01-s1', text: 'I would like to check in for my flight to London.', translation: '我想办理飞往伦敦的航班值机。', note: 'check in 连读时重音落在 check。' },
-          { id: 'airport-01-s2', text: 'Could I have a window seat, please?', translation: '请问可以给我一个靠窗座位吗？', note: 'Could I 的 d 与 I 连读较轻。' },
-          { id: 'airport-01-s3', text: 'How many bags are you checking in today?', translation: '您今天要托运几件行李？', note: 'bags are 中 s 与 a 连读。' },
-          { id: 'airport-01-s4', text: 'Your gate is B twelve and boarding starts at six thirty.', translation: '您的登机口是 B12，六点半开始登机。', note: 'B twelve 按字母 B 加数字读。' }
-        ]
-      },
+      airportCheckinV2,
       {
         id: 'airport-02',
         courseId: 'daily-life',
@@ -30,7 +41,7 @@ export const demoCourses: Course[] = [
         subtitle: 'Security screening',
         level: '入门',
         estimatedMinutes: 5,
-        downloaded: false,
+        version: 1,
         sentences: [
           { id: 'airport-02-s1', text: 'Please place your laptop in a separate tray.', translation: '请把笔记本电脑单独放在一个托盘里。', note: 'place 的结尾辅音与 your 连读。' },
           { id: 'airport-02-s2', text: 'Remove any metal objects from your pockets.', translation: '请取出所有口袋里的金属物品。', note: 'objects from 中 t 可弱读。' },
@@ -53,7 +64,7 @@ export const demoCourses: Course[] = [
         subtitle: 'Confirming action items',
         level: '进阶',
         estimatedMinutes: 7,
-        downloaded: false,
+        version: 1,
         sentences: [
           { id: 'meeting-01-s1', text: 'Let me make sure I understand the next step.', translation: '让我确认一下是否理解下一步。', note: 'make sure 常连读为 /meɪkʃʊr/。' },
           { id: 'meeting-01-s2', text: 'I will share the revised draft by Thursday afternoon.', translation: '我会在周四下午前分享修订稿。', note: 'revised draft 的 d 音相连。' },
@@ -64,15 +75,22 @@ export const demoCourses: Course[] = [
   }
 ];
 
+const demoAirportPackage = createOfflinePackage(airportCheckinV1, new Date('2026-09-20T08:30:00.000Z'));
+
 export const createInitialState = (): PersistedState => ({
-  schemaVersion: 1,
+  schemaVersion: 2,
   courses: structuredClone(demoCourses),
+  offlinePackages: {
+    [demoAirportPackage.lessonId]: demoAirportPackage
+  },
+  downloadingLessonIds: [],
   attempts: [
     {
       id: 'demo-attempt-1',
       lessonId: 'airport-01',
       lessonTitle: '办理值机',
       courseTitle: '日常英语 · 机场与出行',
+      contentVersion: 1,
       submittedAt: '2026-09-24T10:20:00.000Z',
       score: 84,
       teacherFeedback: '连读细节明显进步。注意 bags are 的词尾衔接，再听一遍第二句。',
