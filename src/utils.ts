@@ -1,4 +1,22 @@
-import type { SentenceAttempt, TextSegment, TokenResult } from './types';
+import type { Lesson, SentenceAttempt, TextSegment, TokenResult } from './types';
+
+/** 离线包有效期：30 天。过期后断网不再放行。 */
+export const PACKAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** 课节内容校验和（FNV-1a），用于核对离线包内容是否完好、未被篡改 */
+export function checksumOf(lesson: Lesson): string {
+  const json = JSON.stringify({
+    id: lesson.id,
+    version: lesson.version,
+    sentences: lesson.sentences.map((sentence) => [sentence.id, sentence.text, sentence.translation, sentence.note])
+  });
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < json.length; i += 1) {
+    hash ^= json.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
+}
 
 export const segmentText = (text: string): TextSegment[] => {
   const matches = text.match(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*|[^\s\p{L}\p{N}]+/gu) ?? [];

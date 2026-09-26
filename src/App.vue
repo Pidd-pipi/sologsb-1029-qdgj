@@ -1,7 +1,24 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { courseForLesson, exportRecords, lessonById, persist, saveAttempt, setDownloaded, state, updateTokenClassification } from './store';
-import type { ErrorCategory, Lesson, PracticeAttempt, PracticeView } from './types';
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import {
+  courseForLesson,
+  downloadLesson,
+  exportRecords,
+  formatBytes,
+  isDownloaded,
+  lessonById,
+  packageFor,
+  packageStatus,
+  persist,
+  removePackage,
+  resolveLessonAccess,
+  saveAttempt,
+  state,
+  syncCatalog,
+  updateTokenClassification
+} from './store';
+import type { ErrorCategory, Lesson, LessonProgress, PracticeAttempt, PracticeView, UnavailableReason } from './types';
+import type { LessonAccess } from './store';
 import { compareSentence, scoreAttempt, segmentText } from './utils';
 
 const view = ref<PracticeView>(state.activeLessonId ? 'practice' : 'library');
@@ -13,9 +30,17 @@ const segmentStart = ref(0);
 const segmentEnd = ref(1);
 const teacherAttemptId = ref(state.attempts[0]?.id ?? '');
 const teacherDraft = ref(state.attempts[0]?.teacherFeedback ?? '');
+const downloading = reactive<Record<string, boolean>>({});
+const catalogSyncing = ref(false);
+const activeAccess = ref<LessonAccess>();
+const blockedInfo = ref<{ lessonId: string; reason: UnavailableReason; pkg?: { version: string; cachedAt: string; expiresAt: string } }>();
 let toastTimer = 0;
 
-const activeLesson = computed(() => lessonById(state.activeLessonId));
+const activeLesson = computed<Lesson | undefined>(() => {
+  if (activeAccess.value && !activeAccess.value.blocked) return activeAccess.value.lesson;
+  if (state.activeLessonId) return lessonById(state.activeLessonId);
+  return undefined;
+});
 const activeCourse = computed(() => activeLesson.value ? courseForLesson(activeLesson.value.id) : undefined);
 const currentSentence = computed(() => {
   const lesson = activeLesson.value;
@@ -28,6 +53,8 @@ const currentIndex = computed(() => {
   if (!activeLesson.value || !currentSentence.value) return 0;
   return activeLesson.value.sentences.findIndex((item) => item.id === currentSentence.value?.id);
 });
+/** 旧版本离线包断网打开时只读：可看内容、原答案和练习记录，但不能改、不能提交新听写 */
+const lessonReadOnly = computed(() => activeAccess.value?.blocked === false && activeAccess.value.mode === 'offline-stale');
 const lessonCompletion = computed(() => {
   if (!activeLesson.value || !activeProgress.value) return 0;
   const answered = activeLesson.value.sentences.filter((sentence) => (activeProgress.value?.answers[sentence.id] ?? '').trim()).length;
@@ -38,6 +65,7 @@ const resultSentence = computed(() => resultAttempt.value?.sentenceAttempts[sele
 const teacherAttempt = computed(() => state.attempts.find((attempt) => attempt.id === teacherAttemptId.value));
 const totalWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).length);
 const correctedWords = computed(() => state.attempts.flatMap((attempt) => attempt.sentenceAttempts).flatMap((item) => item.tokens).filter((token) => !token.correct && token.category !== 'unclassified').length);
+const blockedLesson = computed(() => blockedInfo.value ? lessonById(blockedInfo.value.lessonId) : undefined);
 
 const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
   { value: 'unclassified', label: '未分类' },
@@ -49,12 +77,14 @@ const categoryOptions: Array<{ value: ErrorCategory; label: string }> = [
 ];
 
 watch(currentSentence, (sentence) => {
+  // 只读模式同样回填原答案，便于查看；写入由 watch(currentAnswer) 拦截
   currentAnswer.value = sentence && activeProgress.value ? activeProgress.value.answers[sentence.id] ?? '' : '';
   segmentStart.value = 0;
   segmentEnd.value = sentence ? Math.max(0, segmentText(sentence.text).length - 1) : 0;
 }, { immediate: true });
 
 watch(currentAnswer, (value) => {
+  if (lessonReadOnly.value) return;
   const lesson = activeLesson.value;
   const sentence = currentSentence.value;
   if (!lesson || !sentence) return;
@@ -65,17 +95,6 @@ watch(currentAnswer, (value) => {
   state.progress[lesson.id] = progress;
 });
 
-watch(activeLesson, (lesson) => {
-  if (!lesson) return;
-  state.activeLessonId = lesson.id;
-  state.activeSentenceId = currentSentence.value?.id ?? lesson.sentences[0].id;
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
-  if (!lesson.sentences.some((sentence) => sentence.id === progress.activeSentenceId)) progress.activeSentenceId = lesson.sentences[0].id;
-  state.progress[lesson.id] = progress;
-  state.activeSentenceId = progress.activeSentenceId;
-  currentAnswer.value = progress.answers[state.activeSentenceId] ?? '';
-});
-
 watch(teacherAttemptId, (id) => {
   teacherDraft.value = state.attempts.find((attempt) => attempt.id === id)?.teacherFeedback ?? '';
 });
@@ -83,17 +102,43 @@ watch(teacherAttemptId, (id) => {
 function notify(message: string) {
   toast.value = message;
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => { toast.value = ''; }, 2400);
+  toastTimer = window.setTimeout(() => { toast.value = ''; }, 2600);
+}
+
+function emptyProgress(lesson: Lesson): LessonProgress {
+  return { answers: {}, activeSentenceId: lesson.sentences[0]?.id ?? '', updatedAt: new Date().toISOString() };
+}
+
+/** 应用开门结果：被拦截则跳转原因页，否则进入课节并恢复上次进度 */
+function applyAccess(lessonId: string): boolean {
+  const access = resolveLessonAccess(lessonId, online.value);
+  activeAccess.value = access;
+  if (access.blocked) {
+    blockedInfo.value = {
+      lessonId,
+      reason: access.reason,
+      pkg: access.pkg ? { version: access.pkg.version, cachedAt: access.pkg.cachedAt, expiresAt: access.pkg.expiresAt } : undefined
+    };
+    state.activeLessonId = lessonId;
+    view.value = 'unavailable';
+    persist();
+    return false;
+  }
+  const lesson = access.lesson;
+  const progress = state.progress[lessonId] ?? emptyProgress(lesson);
+  if (!lesson.sentences.some((sentence) => sentence.id === progress.activeSentenceId)) progress.activeSentenceId = lesson.sentences[0]?.id ?? '';
+  state.progress[lessonId] = progress;
+  state.activeLessonId = lessonId;
+  state.activeSentenceId = progress.activeSentenceId;
+  currentAnswer.value = progress.answers[state.activeSentenceId] ?? '';
+  segmentStart.value = 0;
+  segmentEnd.value = Math.max(0, segmentText(currentSentence.value?.text ?? '').length - 1);
+  persist();
+  return true;
 }
 
 function startLesson(lesson: Lesson) {
-  const progress = state.progress[lesson.id] ?? { answers: {}, activeSentenceId: lesson.sentences[0].id, updatedAt: new Date().toISOString() };
-  state.progress[lesson.id] = progress;
-  state.activeLessonId = lesson.id;
-  state.activeSentenceId = progress.activeSentenceId || lesson.sentences[0].id;
-  currentAnswer.value = progress.answers[state.activeSentenceId] ?? '';
-  view.value = 'practice';
-  persist();
+  if (applyAccess(lesson.id)) view.value = 'practice';
 }
 
 function goToSentence(index: number) {
@@ -102,7 +147,7 @@ function goToSentence(index: number) {
   const target = lesson.sentences[index];
   state.activeSentenceId = target.id;
   const progress = state.progress[lesson.id];
-  if (progress) {
+  if (progress && !lessonReadOnly.value) {
     progress.activeSentenceId = target.id;
     progress.updatedAt = new Date().toISOString();
   }
@@ -111,6 +156,10 @@ function goToSentence(index: number) {
 }
 
 function submitLesson() {
+  if (lessonReadOnly.value) {
+    notify('旧版本离线包只能查看，联网更新到最新版本后才能提交新听写');
+    return;
+  }
   const lesson = activeLesson.value;
   const course = activeCourse.value;
   if (!lesson || !course) return;
@@ -213,8 +262,129 @@ function formatDate(value: string): string {
   return new Date(value).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
+/** 课程库里每个课节的离线包徽标 */
+function packageBadge(lesson: Lesson): { tone: 'none' | 'ready' | 'stale' | 'expired' | 'invalid' | 'busy'; text: string; actionable: boolean } {
+  if (downloading[lesson.id]) return { tone: 'busy', text: '下载中…', actionable: false };
+  const status = packageStatus(lesson.id);
+  const pkg = packageFor(lesson.id);
+  if (!status || !pkg) return { tone: 'none', text: '未下载', actionable: false };
+  if (status === 'ready') return { tone: 'ready', text: `已缓存 v${pkg.version}`, actionable: false };
+  if (status === 'stale') return { tone: 'stale', text: `待更新 v${pkg.version} → v${lesson.version}`, actionable: online.value };
+  if (status === 'expired') return { tone: 'expired', text: '缓存已过期', actionable: online.value };
+  return { tone: 'invalid', text: '缓存已损坏', actionable: online.value };
+}
+
+async function runDownload(lessonId: string, successMessage: string): Promise<boolean> {
+  if (downloading[lessonId]) return false;
+  downloading[lessonId] = true;
+  try {
+    await downloadLesson(lessonId);
+    notify(successMessage);
+    return true;
+  } catch (error) {
+    notify(error instanceof Error && error.message === 'offline' ? '当前离线，无法下载，请联网后再试' : '下载失败，请重试');
+    return false;
+  } finally {
+    downloading[lessonId] = false;
+  }
+}
+
+/** 开关：开 = 下载离线包（联网）；关 = 只清离线内容，进度与记录保留 */
+async function onToggleDownload(lesson: Lesson, want: boolean) {
+  if (want) {
+    await runDownload(lesson.id, `离线包已下载（v${lesson.version}），断网也可练习`);
+  } else {
+    removePackage(lesson.id);
+    notify('已删除该课节的离线内容，练习进度和记录仍保留');
+  }
+}
+
+/** 点击“待更新 / 已过期 / 已损坏”徽标：联网换新包 */
+async function onBadgeAction(lesson: Lesson) {
+  const badge = packageBadge(lesson);
+  if (!badge.actionable) {
+    if (packageStatus(lesson.id)) notify('当前离线，请联网后再更新离线包');
+    return;
+  }
+  const ok = await runDownload(lesson.id, '离线包已更新到最新版本，旧答案与练习记录保留');
+  if (ok && activeAccess.value && !activeAccess.value.blocked && activeLesson.value?.id === lesson.id) applyAccess(lesson.id);
+}
+
+async function refreshCatalog() {
+  if (catalogSyncing.value || !online.value) return;
+  catalogSyncing.value = true;
+  try {
+    const { updatedLessonIds } = await syncCatalog();
+    if (updatedLessonIds.length) {
+      notify(`教材已更新：${updatedLessonIds.length} 节课有新版本，已下载课节显示“待更新”`);
+    }
+    // 正在练习时同步成功，重新开门一次，切到最新内容（未提交答案仍在）
+    if (view.value === 'practice' && state.activeLessonId && online.value) applyAccess(state.activeLessonId);
+  } catch {
+    // 检查更新失败不影响本机使用。
+  } finally {
+    catalogSyncing.value = false;
+  }
+}
+
+/** 不可用原因页上的“联网下载后打开” */
+async function downloadAndOpen(lesson: Lesson) {
+  const ok = await runDownload(lesson.id, '离线包已下载，正在进入课节');
+  if (ok) startLesson(lesson);
+}
+
+const unavailableTitle = computed(() => {
+  switch (blockedInfo.value?.reason) {
+    case 'not-downloaded': return '这节课还没有下载';
+    case 'expired': return '离线缓存已过期';
+    case 'invalid': return '离线包内容已损坏';
+    default: return '当前无法进入课节';
+  }
+});
+
+const unavailableDetail = computed(() => {
+  switch (blockedInfo.value?.reason) {
+    case 'not-downloaded':
+      return '飞行模式或断网时，只能进入已下载且缓存有效的课节。请联网后在课程库打开下载开关，下载成功会记录课节内容、版本和缓存时间。';
+    case 'expired':
+      return `离线包已于 ${blockedInfo.value.pkg ? formatDate(blockedInfo.value.pkg.expiresAt) : ''} 过期（有效期 30 天）。为保证练习内容不过时，断网不再放行，请联网后重新下载。`;
+    case 'invalid':
+      return '本机保存的离线包内容与下载时不一致，校验未通过。请联网后重新下载该课节。';
+    default:
+      return '请联网后重试。';
+  }
+});
+
+/** 练习页顶部的离线包提示（仅在包需要处理时出现） */
+const practiceNotice = computed<{ tone: 'stale-readonly' | 'stale-online' | 'expired' | 'invalid'; text: string } | null>(() => {
+  const access = activeAccess.value;
+  if (!access || access.blocked || !access.pkg) return null;
+  const latestVersion = lessonById(access.pkg.lessonId)?.version;
+  if (access.mode === 'offline-stale') {
+    return { tone: 'stale-readonly', text: `你正在查看旧版本离线包 v${access.pkg.version}（最新 v${latestVersion ?? '?'}）。断网可看课节内容、原答案和练习记录，但不能提交新听写；联网后更新即可继续。` };
+  }
+  if (access.mode === 'online-stale') {
+    const status = packageStatus(access.pkg.lessonId);
+    if (status === 'expired') return { tone: 'expired', text: `离线包已于 ${formatDate(access.pkg.expiresAt)} 过期。在线练习不受影响，建议重新下载，否则断网无法进入。` };
+    if (status === 'invalid') return { tone: 'invalid', text: '离线包内容校验失败。在线练习不受影响，建议重新下载，否则断网无法进入。' };
+    return { tone: 'stale-online', text: `教材已更新到 v${latestVersion ?? '?'}，离线包仍是 v${access.pkg.version}。更新离线包后，断网也能练新版本（进度和记录保留）。` };
+  }
+  return null;
+});
+
+async function updateActivePackage() {
+  const lesson = activeLesson.value;
+  if (!lesson) return;
+  const ok = await runDownload(lesson.id, '离线包已更新到最新版本');
+  if (ok) applyAccess(lesson.id);
+}
+
 function onConnectionChange() {
   online.value = navigator.onLine;
+  // 网络变化后重新执行开门规则：断网只放行校验通过且未过期的包
+  if ((view.value === 'practice' || view.value === 'unavailable') && state.activeLessonId) {
+    applyAccess(state.activeLessonId);
+  }
   persist();
 }
 
@@ -227,6 +397,9 @@ onMounted(() => {
   window.addEventListener('offline', onConnectionChange);
   window.addEventListener('visibilitychange', onVisibilityChange);
   window.addEventListener('pagehide', persist);
+  // 刷新或旋转后重新进入时，按当前网络状态执行一次开门校验
+  if (view.value === 'practice' && state.activeLessonId) applyAccess(state.activeLessonId);
+  refreshCatalog();
 });
 
 onBeforeUnmount(() => {
@@ -256,7 +429,7 @@ onBeforeUnmount(() => {
 
         <section class="hero">
           <h2>今天也把声音变成文字</h2>
-          <p>下载课程后可离线作答，答案和当前位置会自动恢复。</p>
+          <p>下载课程离线包后可断网作答；包内记录课节内容、版本与缓存时间，过期或未下载的课节断网不可进入。</p>
           <div class="hero-stats">
             <div class="hero-stat"><strong>{{ state.attempts.length }}</strong><span>练习记录</span></div>
             <div class="hero-stat"><strong>{{ correctedWords }}</strong><span>已分类错误</span></div>
@@ -265,8 +438,8 @@ onBeforeUnmount(() => {
         </section>
 
         <div class="offline-banner" :class="{ online }">
-          <span>{{ online ? '● 在线 · 数据已保存到本机' : '● 离线模式 · 可继续已下载课程' }}</span>
-          <span>{{ online ? '本地优先存储' : '恢复网络后继续保存' }}</span>
+          <span>{{ online ? '● 在线 · 可下载或更新离线包' : '● 飞行模式 · 仅可进入已缓存且未过期的课节' }}</span>
+          <span>{{ catalogSyncing ? '正在检查教材更新…' : `教材版本 ${state.catalogUpdatedAt}` }}</span>
         </div>
 
         <div class="section-head">
@@ -283,15 +456,34 @@ onBeforeUnmount(() => {
             <span class="level-badge">{{ course.level }}</span>
           </div>
           <div v-for="lesson in course.lessons" :key="lesson.id" class="lesson-row">
-            <div><h4>{{ lesson.title }}</h4><p>{{ lesson.subtitle }} · {{ lesson.sentences.length }} 句 · 约 {{ lesson.estimatedMinutes }} 分钟</p></div>
+            <div class="lesson-info">
+              <h4>{{ lesson.title }}</h4>
+              <p>{{ lesson.subtitle }} · {{ lesson.sentences.length }} 句 · 约 {{ lesson.estimatedMinutes }} 分钟 · 最新 v{{ lesson.version }}</p>
+              <button
+                type="button"
+                class="pkg-badge"
+                :class="packageBadge(lesson).tone"
+                :disabled="!packageBadge(lesson).actionable"
+                @click="onBadgeAction(lesson)"
+              >
+                {{ packageBadge(lesson).text }}
+              </button>
+              <p v-if="packageFor(lesson.id)" class="pkg-detail">
+                缓存于 {{ formatDate(packageFor(lesson.id)!.cachedAt) }} · {{ formatBytes(packageFor(lesson.id)!.size) }} · {{ formatDate(packageFor(lesson.id)!.expiresAt) }} 前有效
+              </p>
+            </div>
             <div class="lesson-actions">
-              <var-switch :model-value="lesson.downloaded" @update:model-value="setDownloaded(lesson.id, $event as boolean)" />
-              <var-button type="primary" size="small" @click="startLesson(lesson)">{{ lesson.downloaded ? '继续' : '开始' }}</var-button>
+              <var-switch
+                :model-value="isDownloaded(lesson.id)"
+                :disabled="downloading[lesson.id] === true"
+                @update:model-value="onToggleDownload(lesson, $event as boolean)"
+              />
+              <var-button type="primary" size="small" @click="startLesson(lesson)">{{ isDownloaded(lesson.id) ? '继续' : '开始' }}</var-button>
             </div>
           </div>
         </article>
 
-        <div class="section-head"><h3>最近练习</h3><span>{{ state.attempts.length }} 条记录</span></div>
+        <div class="section-head"><h3>最近练习</h3><span>{{ state.attempts.length }} 条记录 · 关闭下载不会清除</span></div>
         <article v-if="state.attempts.length" class="panel">
           <div v-for="attempt in state.attempts.slice(0, 4)" :key="attempt.id" class="history-card">
             <div class="history-top"><strong>{{ attempt.lessonTitle }}</strong><span class="history-score">{{ attempt.score }} 分</span></div>
@@ -307,13 +499,23 @@ onBeforeUnmount(() => {
           <div class="practice-nav">
             <button class="back-button" aria-label="返回课程库" @click="view = 'library'">‹</button>
             <div><h2>{{ activeLesson.title }}</h2></div>
-            <span class="status-chip">{{ online ? '在线' : '离线' }}</span>
+            <span class="status-chip">{{ online ? '在线' : '离线' }} · v{{ activeLesson.version }}</span>
           </div>
           <div class="progress-line">
             <div class="sentence-count"><span>第 {{ currentIndex + 1 }} / {{ activeLesson.sentences.length }} 句</span><span>{{ lessonCompletion }}% 已填写</span></div>
             <var-progress :value="lessonCompletion" color="#1769e0" />
           </div>
         </header>
+
+        <div v-if="practiceNotice" class="practice-notice" :class="practiceNotice.tone">
+          <span>{{ practiceNotice.text }}</span>
+          <var-button v-if="practiceNotice.tone !== 'stale-readonly' && online" size="small" color="currentColor" @click="updateActivePackage">
+            {{ practiceNotice.tone === 'stale-online' ? '更新离线包' : '重新下载' }}
+          </var-button>
+        </div>
+        <div v-if="lessonReadOnly" class="practice-notice readonly-action">
+          <span>只读模式：可查看本课内容、原答案与练习记录，但不能编辑或提交新听写。</span>
+        </div>
 
         <section class="audio-card">
           <div class="audio-meta">
@@ -322,11 +524,11 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <div class="dictation-label"><strong>输入听到的内容</strong><span>答案在本机自动保存</span></div>
-        <textarea v-model="currentAnswer" class="answer-box" :aria-label="`第 ${currentIndex + 1} 句听写答案`" placeholder="Type what you hear..." @keydown.ctrl.enter="submitLesson" @keydown.meta.enter="submitLesson"></textarea>
+        <div class="dictation-label"><strong>输入听到的内容</strong><span>{{ lessonReadOnly ? '旧版本离线包 · 只读' : '答案在本机自动保存' }}</span></div>
+        <textarea v-model="currentAnswer" class="answer-box" :disabled="lessonReadOnly" :aria-label="`第 ${currentIndex + 1} 句听写答案`" placeholder="Type what you hear..." @keydown.ctrl.enter="submitLesson" @keydown.meta.enter="submitLesson"></textarea>
         <div class="practice-actions">
           <var-button block type="default" variant="outline" @click="replay(currentSentence?.text ?? '')">再听一次</var-button>
-          <var-button block type="primary" @click="submitLesson">提交本次听写</var-button>
+          <var-button block type="primary" :disabled="lessonReadOnly" @click="submitLesson">提交本次听写</var-button>
         </div>
 
         <div class="sentence-picker" aria-label="句子导航">
@@ -336,6 +538,32 @@ onBeforeUnmount(() => {
         <section v-if="currentSentence" class="panel">
           <div class="detail-head"><div><h3>场景提示</h3><p>{{ currentSentence.translation }}</p></div></div>
           <div class="feedback-card">{{ currentSentence.note }}</div>
+        </section>
+      </div>
+
+      <div v-else-if="view === 'unavailable'" class="page">
+        <header class="practice-header">
+          <div class="practice-nav">
+            <button class="back-button" aria-label="返回课程库" @click="view = 'library'">‹</button>
+            <div><h2>{{ blockedLesson?.title ?? '课节不可用' }}</h2></div>
+            <span class="status-chip">{{ online ? '在线' : '离线' }}</span>
+          </div>
+        </header>
+
+        <section class="panel unavailable-card">
+          <div class="unavailable-icon" :class="blockedInfo?.reason">!</div>
+          <h2>{{ unavailableTitle }}</h2>
+          <p>{{ unavailableDetail }}</p>
+          <dl v-if="blockedInfo?.pkg" class="unavailable-meta">
+            <div><dt>离线包版本</dt><dd>v{{ blockedInfo.pkg.version }}</dd></div>
+            <div><dt>缓存时间</dt><dd>{{ formatDate(blockedInfo.pkg.cachedAt) }}</dd></div>
+            <div><dt>到期时间</dt><dd>{{ formatDate(blockedInfo.pkg.expiresAt) }}</dd></div>
+          </dl>
+          <div class="unavailable-actions">
+            <var-button block variant="outline" @click="view = 'library'">返回课程库</var-button>
+            <var-button v-if="blockedLesson" block type="primary" :loading="downloading[blockedLesson.id] === true" @click="downloadAndOpen(blockedLesson)">联网下载后进入</var-button>
+          </div>
+          <p class="unavailable-note">练习进度与历史记录始终保留在本机，删除或重新下载离线包都不会丢失。</p>
         </section>
       </div>
 
@@ -362,7 +590,7 @@ onBeforeUnmount(() => {
             <span class="history-score">{{ resultSentence.score }}%</span>
           </div>
           <div class="word-list">
-            <button v-for="token in resultSentence.tokens" :key="`${token.index}-${token.expected}-${token.actual}`" class="word-chip" :class="{ wrong: !token.correct }" :title="token.correct ? '点击重听' : `你的答案：${token.actual || '未输入'}`" @click="replay(token.expected || token.actual, 0.7)">
+            <button v-for="token in resultSentence.tokens" :key="`${token.index}-${token.expected}--${token.actual}`" class="word-chip" :class="{ wrong: !token.correct }" :title="token.correct ? '点击重听' : `你的答案：${token.actual || '未输入'}`" @click="replay(token.expected || token.actual, 0.7)">
               {{ token.expected || `[+${token.actual}]` }}<small v-if="!token.correct">{{ token.actual || '漏词' }}</small>
             </button>
           </div>
@@ -391,7 +619,7 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-if="resultAttempt.teacherFeedback" class="panel"><div class="feedback-card"><strong>教师反馈</strong><p>{{ resultAttempt.teacherFeedback }}</p></div></section>
-        <var-button block type="primary" @click="startLesson(activeLesson!)">返回本次课程</var-button>
+        <var-button v-if="activeLesson" block type="primary" @click="startLesson(activeLesson)">返回本次课程</var-button>
         <var-button block type="default" variant="outline" style="margin-top: 10px" @click="downloadRecords">导出练习记录</var-button>
       </div>
 
